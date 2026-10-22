@@ -1,3 +1,58 @@
+# FreeToken —  fork (unofficial)
+
+&gt; **Personal fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken).**
+&gt; Not affiliated with or endorsed by the upstream team.
+&gt; For the official project, see the upstream repository.
+
+**Tested environment (only):**
+
+- Hardware: RTX 5080 16G VRAM + 128G RAM, Windows 11
+- Model: Qwen3.8-Flash-Next-NVFP4 (Qwen4Exp arch)
+
+All changes in this fork are developed and verified **only** on this
+combination. Other GPUs, operating systems, and model architectures are
+untested — the QSA index-tiers work below is specific to the `qwen4exp`
+sparse-attention path and does not apply to standard MHA/MoE models.
+
+**Changes in this fork** (all tested only on the environment above;
+see [PROGRESS.md](./PROGRESS.md) for full details):
+
+- KV cache swap to host RAM / SSD with cross-restart session restore
+- Restore-path completeness: persist QSA `_cmp_k_buffer` /
+  `_rope_positions` alongside KV (long-context restore correctness)
+- Mamba/GDN snapshot capture-before-evict: slot eviction degrades to
+  host/SSD restore instead of permanent session loss
+- Idle-time KV preload, page-accounting hardening, session-colored logs
+- MoE: shared-expert side-stream overlap (#678-style), router lookahead measure
+- Windows-oriented: portable fat deployment, patched venv workflow
+
+**Development & AI assistance:**
+
+The changes in this fork were implemented **with substantial AI
+assistance** (design discussion, code generation, and testing executed
+collaboratively between the maintainer and AI coding agents). The
+maintainer directs all design decisions, reviews every change, and
+performs final verification on real hardware. Corrections are welcome
+— and upstream is encouraged to adopt any of these changes.
+
+**Known limitations (GDN snapshot layer):**
+
+- Geometry changes / cache rebuilds drop all live GDN snapshots
+  (a warning is logged; affected sessions fall back to host/SSD
+  restore instead of fast resume)
+- Restore needs a free mamba slot; when the pool is full the request
+  degrades to full prefill rather than queueing forever
+- GDN far-context recall degrades with sequence length — this is
+  architecture-inherent and not fixable at the serving layer
+- Mamba slots and KV pages share one VRAM budget: raising the
+  concurrent-session limit shortens max context length and vice versa
+
+All changes are experimental; correctness verified by automated tests
+and hardware-in-the-loop measurement. Use at your own risk.
+
+License: Apache-2.0 (same as upstream).
+
+---
 <div align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/FlashML-org/FreeToken/main/assets/freetoken-logo-dark.svg">
