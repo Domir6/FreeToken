@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from collections.abc import Sequence
 from typing import TextIO
@@ -27,7 +28,12 @@ Use "ft --version" to print the FreeToken version.""",
 def _run_serve(argv: list[str]) -> int:
     from freetoken.server import launch_server
 
-    launch_server(argv=argv, prog="ft serve")
+    try:
+        launch_server(argv=argv, prog="ft serve")
+    except KeyboardInterrupt:
+        # Windows CTRL_C_EVENT: uvicorn re-raises the captured signal after the app has
+        # already shut down cleanly, so this is an expected exit, not an error.
+        return 130
     return 0
 
 
@@ -102,6 +108,13 @@ COMMANDS = {
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    if os.name == "nt":
+        # Make every descendant interpreter (engine, scheduler, detokenizer, spawned
+        # serves) default open() to UTF-8 (PEP 540): our own call sites pass encoding=
+        # explicitly, but third-party code in those children reads configs with bare
+        # open(), which uses the ANSI codepage (GBK on zh-Windows). Too late for THIS
+        # process by design -- UTF-8 mode is fixed at interpreter startup.
+        os.environ.setdefault("PYTHONUTF8", "1")
     args = list(sys.argv[1:] if argv is None else argv)
     if not args:
         _print_help(sys.stderr)
