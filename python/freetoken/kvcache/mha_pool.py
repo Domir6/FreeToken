@@ -135,6 +135,32 @@ class MHAKVCache(BaseKVCachePool):
             v=v,
         )
 
+    def gather_kv(self, slots: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        idx = slots.to(device=self._device, dtype=torch.long)
+        num_storage_layers = self._kv_buffer.shape[1]
+        shape = (num_storage_layers, int(idx.numel()), *self._storage_shape[1:])
+        k_out = torch.empty(shape, device=self._device, dtype=self.dtype)
+        v_out = torch.empty(shape, device=self._device, dtype=self.dtype)
+        for dense in range(num_storage_layers):
+            k_out[dense].copy_(
+                self._k_buffer[dense].view(self._storage_shape).index_select(0, idx)
+            )
+            v_out[dense].copy_(
+                self._v_buffer[dense].view(self._storage_shape).index_select(0, idx)
+            )
+        return k_out, v_out
+
+    def scatter_kv(self, slots: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
+        idx = slots.to(device=self._device, dtype=torch.long)
+        num_storage_layers = self._kv_buffer.shape[1]
+        for dense in range(num_storage_layers):
+            self._k_buffer[dense].view(self._storage_shape).index_copy_(
+                0, idx, k[dense].to(device=self._device, dtype=self.dtype)
+            )
+            self._v_buffer[dense].view(self._storage_shape).index_copy_(
+                0, idx, v[dense].to(device=self._device, dtype=self.dtype)
+            )
+
     @property
     def device(self) -> torch.device:
         return self._device

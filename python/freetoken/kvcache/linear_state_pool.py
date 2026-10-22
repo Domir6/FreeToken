@@ -8,6 +8,11 @@ from freetoken.env import ENV
 from freetoken.models.config import LinearGatedDeltaGroupConfig, SlotStateSpec
 from freetoken.utils import div_even
 
+from freetoken.utils import init_logger
+
+logger = init_logger(__name__)
+from freetoken.utils import div_even
+
 _SSM_DTYPES = {
     "float32": torch.float32,
     "bfloat16": torch.bfloat16,
@@ -146,6 +151,12 @@ class LinearStatePool:
         live/snapshot state is dropped, so the caller must guarantee no running request
         holds a slot and the radix tree owning donated snapshots is discarded too.
         """
+        held = (self._num_slots - 1) - len(self._free_slots)
+        logger.warning(
+            f"LinearStatePool.rebuild drops {held} held slot(s) "
+            "(live + donated mamba snapshots): historical sessions will full-prefill"
+        )
+
         n_layers, _, local_conv_dim, km1 = self.conv_states.shape
         _, _, local_v_heads, key_head_dim, value_head_dim = self.recurrent_states.shape
         conv_dtype, rec_dtype = self.conv_states.dtype, self.recurrent_states.dtype
@@ -192,6 +203,25 @@ class LinearStatePool:
         self.recurrent_states[:, dst].copy_(self.recurrent_states[:, src])
         for t in self.slot_states.values():
             t[:, dst].copy_(t[:, src])
+
+    def snapshot_slot(self, slot: int) -> dict:
+        """Detach a whole-sequence snapshot of ``slot`` to CPU (for host offload)."""
+        out = {
+            "conv": self.conv_states[:, slot].detach().to("cpu", copy=True),
+            "recurrent": self.recurrent_states[:, slot].detach().to("cpu", copy=True),
+        }
+        for name, t in self.slot_states.items():
+            out[name] = t[:, slot].detach().to("cpu", copy=True)
+        return out
+
+    def restore_slot(self, slot: int, data: dict) -> None:
+        """Restore a CPU snapshot produced by ``snapshot_slot`` into ``slot``."""
+        with torch.no_grad():
+            self.conv_states[:, slot].copy_(data["conv"])
+            self.recurrent_states[:, slot].copy_(data["recurrent"])
+            for name, t in self.slot_states.items():
+                if name in data:
+                    t[:, slot].copy_(data[name])
 
     def is_linear_layer(self, layer_id: int) -> bool:
         return layer_id in self._local_index
