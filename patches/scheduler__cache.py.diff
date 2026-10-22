@@ -1,0 +1,863 @@
+--- a/scheduler/cache.py
++++ b/scheduler/cache.py
+@@ -7,7 +7,9 @@
+ import torch
+ from freetoken.core import Req
+ from freetoken.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
+-from freetoken.utils import align_down, div_ceil
++from freetoken.utils import align_down, div_ceil, init_logger
++
++logger = init_logger(__name__)
+ 
+ if TYPE_CHECKING:
+     from .utils import PendingReq
+@@ -28,10 +30,30 @@
+ # the client drops reasoning (Qwen's "<think>\n": the re-render diverges 2 tokens BEFORE P).
+ _SWA_RETAIN_GAP = 16
+ 
++# One-shot notice when host/SSD restore is administratively disabled.
++_RESTORE_DISABLED_WARNED = False
++
++
++class KVAllocationError(RuntimeError):
++
++    """KV pool could not seat a request even after eviction.
++
++
++
++    Raised instead of a bare assert so the caller can surface it as a request-level failure
++
++    (abort/queue) rather than killing the worker process.
++
++    """
++
++
++
++
+ 
+ class CacheManager:
+     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
+-                 linear_state_pool=None, swa_pool=None, sliding_window_size=None):
++                 linear_state_pool=None, swa_pool=None, sliding_window_size=None,
++                 kv_pool=None, host_store=None):
+         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
+         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
+         device = page_table.device
+@@ -42,6 +64,8 @@
+         # the plain naive/radix path.
+         self.linear_state_pool = linear_state_pool
+         self.swa_pool = swa_pool
++        self.kv_pool = kv_pool
++        self.host_store = host_store
+         self.sliding_window_size = sliding_window_size
+         self.is_hybrid = type == "hybrid_radix"
+         self.is_swa = type == "swa_radix"
+@@ -61,6 +85,69 @@
+         self.page_table = page_table
+         self.page_size = page_size
+         self.cache_type = type
++        self._attach_evict_hook()
++
++    def _attach_evict_hook(self) -> None:
++
++        # Mamba-only capture-on-evict (default ON). When a node's GDN snapshot slot is about
++
++        # to be reclaimed we persist JUST that snapshot (one D2H, ~110 MiB) so the historical
++
++        # session can still resume later. KV is deliberately NOT copied here (the idle preload
++
++        # owns that); a full capture-on-evict synchronously gathers KV and stalls decode.
++
++        import os
++
++
++
++        mamba_enabled = (
++
++            os.environ.get("FREETOKEN_KV_SWAP_MAMBA_ON_EVICT", "1").strip().lower()
++
++        )
++
++        if mamba_enabled not in ("", "0", "false", "no", "off") and self.host_store is not None:
++
++            try:
++
++                self.prefix_cache._kv_mamba_capture = self.host_store.capture_evicted_mamba
++
++            except Exception:
++
++                pass
++
++
++
++        # Capture-on-evict does a synchronous D2H inside the eviction path and can stall
++
++        # decode on long contexts; the default is to leave it off and dump at stop time
++
++        # (KVHostStore.capture_resident). Opt in with FREETOKEN_KV_SWAP_CAPTURE_ON_EVICT=1.
++
++        import os
++
++
++
++        enabled = os.environ.get("FREETOKEN_KV_SWAP_CAPTURE_ON_EVICT", "0").strip().lower()
++
++        if enabled in ("", "0", "false", "no", "off"):
++
++            return
++
++        if self.host_store is not None and hasattr(self.prefix_cache, "evict_hook"):
++
++            # page_size, not the 512-token host-store default: the dump/restore chain must stay
++
++            # contiguous from token 0, so a skipped 64..511-token node would break it.
++
++            page_size = self.page_size
++
++            self.prefix_cache.evict_hook = lambda node: self.host_store.capture_node(
++
++                node, min_tokens=page_size
++
++            )
+ 
+     # ----- capability hooks (defaults; plugged-in pools may narrow them) -----
+     supports_runtime_rebuild = True
+@@ -109,6 +196,462 @@
+             return MatchResult(
+                 HybridCacheHandle(m.cached_len, m.node, m.kv_indices), mamba_value=m.mamba_value)
+         return self.prefix_cache.match_prefix(ids)
++
++    def _try_reattach_mamba(self, input_ids: torch.Tensor, handle: BaseCacheHandle):
++
++        """Re-attach a persisted GDN snapshot to a tombstoned tree node -- zero KV copy."""
++
++        store = self.host_store
++
++
++
++        pc = self.prefix_cache
++
++
++
++        walk = getattr(pc, "_walk", None)
++
++
++
++        if store is None or walk is None:
++
++            return None
++
++
++
++        from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
++
++
++
++        try:
++
++            node, prefix_len = walk(input_ids)
++
++        except Exception:
++
++            return None
++
++
++
++        cur, end_len = node, prefix_len
++
++
++
++        while not cur.is_root() and end_len > handle.cached_len:
++
++            if cur.mamba_value is None:
++
++                ids = input_ids[:end_len]
++
++                entry = store.lookup(ids, min_len=0, require_kv=False)
++
++                if entry is not None and entry.mamba is not None and entry.length == end_len:
++
++                    pool = self.linear_state_pool
++
++                    if pool.num_free_slots < 1:
++
++                        self.ensure_mamba_slots(1)
++
++                    if pool.num_free_slots < 1:
++
++                        return None
++
++
++
++                    mamba_slot = pool.alloc(1)[0]
++
++                    try:
++
++                        pool.restore_slot(mamba_slot, entry.mamba)
++
++                        if os.environ.get("FREETOKEN_KV_RESTORE_VERIFY", "0") == "1":
++
++                            _snap = pool.snapshot_slot(mamba_slot)
++
++                            _dmax = 0.0
++
++                            for _k in entry.mamba:
++
++                                if _k in _snap:
++
++                                    _dmax = max(
++
++                                        _dmax,
++
++                                        (_snap[_k].float() - entry.mamba[_k].float())
++
++                                        .abs()
++
++                                        .max()
++
++                                        .item(),
++
++                                    )
++
++                            try:
++
++                                with open(
++
++                                    r"C:\AI_Models\logs\restore_verify.log",
++
++                                    "a",
++
++                                    encoding="utf-8",
++
++                                ) as _fh:
++
++                                    _fh.write(
++
++                                        f"mamba reattach verify: max|d|={_dmax:.6g} "
++
++                                        f"keys={len(entry.mamba)}\n"
++
++                                    )
++
++                            except OSError:
++
++                                pass
++
++                    except Exception:
++
++                        pool.free([mamba_slot])
++
++                        return None
++
++
++
++                    cur.mamba_value = mamba_slot
++
++                    m = pc.match_prefix(ids)
++
++                    new_handle = HybridCacheHandle(m.cached_len, m.node, m.kv_indices)
++
++                    self.unlock(handle)
++
++                    self.lock(new_handle)
++
++                    store.take(entry)
++
++                    self._kv_diag(f"reattach ok entry={entry.length} add=0")
++
++                    logger.info(
++
++                        f"host KV mamba re-attach: resumed {end_len} tokens "
++
++                        f"(prefix {entry.length}) without copying KV"
++
++                    )
++
++                    return new_handle
++
++            end_len -= cur.length
++
++            cur = cur.parent
++
++
++
++        return None
++
++
++
++    def attempt_host_restore(self, input_ids: torch.Tensor, handle: BaseCacheHandle) -> BaseCacheHandle:
++
++        """Extend a GPU radix hit with a longer prefix that was offloaded to host memory.
++
++
++
++        Requires the GPU match to end exactly where the host entry's KV begins (the entry's
++
++        parent chain). Allocates fresh pages, copies K/V + the GDN snapshot back, re-inserts
++
++        the prefix into the radix tree, and migrates the lock from ``handle`` to the new one.
++
++        """
++
++        store = self.host_store
++
++        if store is None or self.kv_pool is None or self.is_swa:
++
++            return handle
++
++        if os.environ.get("FREETOKEN_KV_RESTORE", "1").strip().lower() in ("0", "false", "off", "no"):
++
++            global _RESTORE_DISABLED_WARNED
++
++            if not _RESTORE_DISABLED_WARNED:
++
++                _RESTORE_DISABLED_WARNED = True
++
++                logger.info(
++
++                    "host KV restore disabled (FREETOKEN_KV_RESTORE=0); "
++
++                    "SSD entries are written but not reloaded"
++
++                )
++
++            return handle
++
++        cached_len = handle.cached_len
++
++        if self.is_hybrid:
++
++            reattached = self._try_reattach_mamba(input_ids, handle)
++
++            if reattached is not None:
++
++                return reattached
++
++            cached_len = handle.cached_len
++
++
++
++        entry = store.lookup(input_ids, min_len=cached_len)
++
++        if entry is None or entry.kv_start > cached_len or entry.length <= cached_len:
++
++            return handle
++
++        # The entry can reach back before the GPU hit (e.g. two sessions sharing the same
++
++        # template pages); only the part beyond the hit's end is copied.
++
++        skip = cached_len - entry.kv_start
++
++        add = entry.length - cached_len
++
++        if add <= 0 or add % self.page_size != 0 or skip % self.page_size != 0:
++
++            return handle
++
++        slots = self._page_to_token(self._allocate(add // self.page_size))
++
++        mamba_slot = None
++
++        try:
++
++            self.kv_pool.scatter_kv(slots, entry.kv_k[:, skip:], entry.kv_v[:, skip:])
++
++            # QSA keeps two per-token tiers outside the K/V pages: the compressed index-key
++
++            # shadow (one row per index_ratio tokens) and the mrope position of every token.
++
++            # Without them a restored prefix scores against zero index rows, which only shows
++
++            # up once the context is long enough for the sparse indexer to do real selection.
++
++            cmp_src = entry.cmp_index
++
++            rope_src = entry.rope_pos
++
++            if cmp_src is not None:
++
++                ratio = int(getattr(self.kv_pool, "index_ratio", 1))
++
++                cmp_src = cmp_src[:, skip // ratio :]
++
++            if rope_src is not None:
++
++                rope_src = rope_src[skip:]
++
++            if hasattr(self.kv_pool, "scatter_index_tiers") and (
++
++                cmp_src is not None or rope_src is not None
++
++            ):
++
++                self.kv_pool.scatter_index_tiers(slots, cmp_src, rope_src)
++
++            if self.device.type == "cuda":
++
++                torch.cuda.current_stream(self.device).synchronize()
++
++            if os.environ.get("FREETOKEN_KV_RESTORE_VERIFY", "0") == "1":
++
++                k2, v2 = self.kv_pool.gather_kv(slots)
++
++                k1 = entry.kv_k[:, skip:].to(device=k2.device, dtype=torch.float32)
++
++                v1 = entry.kv_v[:, skip:].to(device=v2.device, dtype=torch.float32)
++
++                _dk = (k2.float() - k1).abs().max().item()
++
++                _dv = (v2.float() - v1).abs().max().item()
++
++                _dimsg = ""
++
++                if hasattr(self.kv_pool, "gather_index_tiers"):
++
++                    _c2, _r2 = self.kv_pool.gather_index_tiers(slots)
++
++                    if cmp_src is not None:
++
++                        _dc = (
++
++                            _c2.float() - cmp_src.to(_c2.device).float()
++
++                        ).abs().max().item()
++
++                        _dimsg += f" max|dCmp|={_dc:.6g}"
++
++                    if rope_src is not None and _r2 is not None:
++
++                        _dr = (
++
++                            _r2.to(torch.int64) - rope_src.to(_r2.device, torch.int64)
++
++                        ).abs().max().item()
++
++                        _dimsg += f" max|dRope|={_dr}"
++
++                try:
++
++                    with open(r"C:\AI_Models\logs\restore_verify.log", "a", encoding="utf-8") as _fh:
++
++                        _fh.write(
++
++                            f"KV restore verify: max|dK|={_dk:.6g} max|dV|={_dv:.6g} "
++
++                            f"skip={skip} add={add} length={entry.length}{_dimsg}\n"
++
++                        )
++
++                except OSError:
++
++                    pass
++
++                logger.warning(
++
++                    f"KV restore verify: max|dK|={_dk:.6g} max|dV|={_dv:.6g} "
++
++                    f"skip={skip} add={add} length={entry.length}{_dimsg}"
++
++                )
++
++            if self.is_hybrid:
++
++                pool = self.linear_state_pool
++
++                if pool.num_free_slots < 1:
++
++                    self.ensure_mamba_slots(1)
++
++                if pool.num_free_slots < 1:
++
++                    raise RuntimeError("LinearStatePool exhausted while restoring host KV")
++
++                mamba_slot = pool.alloc(1)[0]
++
++                if entry.mamba is not None:
++
++                    pool.restore_slot(mamba_slot, entry.mamba)
++
++                    if os.environ.get("FREETOKEN_KV_RESTORE_VERIFY", "0") == "1":
++
++                        _snap = pool.snapshot_slot(mamba_slot)
++
++                        _dmax = 0.0
++
++                        for _k in entry.mamba:
++
++                            if _k in _snap:
++
++                                _dmax = max(
++
++                                    _dmax,
++
++                                    (_snap[_k].float() - entry.mamba[_k].float()).abs().max().item(),
++
++                                )
++
++                        try:
++
++                            with open(
++
++                                r"C:\AI_Models\logs\restore_verify.log", "a", encoding="utf-8"
++
++                            ) as _fh:
++
++                                _fh.write(
++
++                                    f"mamba restore verify: max|d|={_dmax:.6g} "
++
++                                    f"keys={len(entry.mamba)}\n"
++
++                                )
++
++                        except OSError:
++
++                            pass
++
++                else:
++
++                    pool.reset(mamba_slot)
++
++            ids = input_ids[: entry.length]
++
++            matched = handle.get_matched_indices()[:cached_len].to(slots.device)
++
++            full_slots = torch.cat([matched, slots])
++
++            if self.is_hybrid:
++
++                from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
++
++                _prefix_len, existed = self.prefix_cache.insert(ids, full_slots, mamba_slot)
++
++                if existed:
++
++                    raise RuntimeError("host KV restore collided with an existing snapshot")
++
++                _unused = _prefix_len - cached_len if _prefix_len > cached_len else 0
++
++                if _unused > 0:
++
++                    self._free(slots[:_unused])
++
++                m = self.prefix_cache.match_prefix(ids)
++
++                new_handle = HybridCacheHandle(m.cached_len, m.node, m.kv_indices)
++
++            else:
++
++                new_handle = self.prefix_cache.insert_prefix(ids, full_slots).handle
++
++        except Exception:
++
++            if mamba_slot is not None:
++
++                self.linear_state_pool.free([mamba_slot])
++
++            self._free(slots)
++
++            self._kv_diag(f"restore FAIL cached={cached_len} entry={entry.length} add={add}")
++
++            raise
++
++        self.unlock(handle)
++
++        self.lock(new_handle)
++
++        store.take(entry)
++
++        self._kv_diag(
++
++            f"restore ok cached={cached_len} entry={entry.length} add={add} skip={skip}"
++
++        )
++
++        logger.info(
++
++            f"host KV swap-in: restored {add} tokens (prefix {entry.length}), "
++
++            f"{store.summary()}"
++
++        )
++
++        return new_handle
+ 
+     @property
+     def available_size(self) -> int:
+@@ -272,7 +815,19 @@
+                 needed_pages += last_page - first_page
+                 allocation_info.append((req.table_idx, first_page, last_page))
+         if needed_pages > 0:
+-            allocated = self._page_to_token(self._allocate(needed_pages))
++            try:
++
++                allocated = self._page_to_token(self._allocate(needed_pages))
++
++            except KVAllocationError as exc:
++
++                logger.error(
++
++                    f"KV allocation failed for a batch of {len(reqs)} request(s): {exc}"
++
++                )
++
++                raise
+             if self.swa_paged:
+                 # Each newly-allocated full token needs a swa-pool slot (where its SWA-layer KV is
+                 # written; read back via the full->swa mapping). radix reuses the existing prefix's
+@@ -287,7 +842,17 @@
+         if self.is_swa:
+             return self._cache_req_swa(req, finished=finished)
+         if self.is_hybrid:
+-            return self._cache_req_hybrid(req, finished=finished)
++            self._kv_diag(
++                f"cache_req enter finished={finished} cached={req.cached_len} "
++                f"handle={req.cache_handle.cached_len}"
++            )
++            try:
++                return self._cache_req_hybrid(req, finished=finished)
++            finally:
++                self._kv_diag(
++                    f"cache_req exit finished={finished} cached={req.cached_len} "
++                    f"handle={req.cache_handle.cached_len}"
++                )
+         # ==================================== valid cache region ====================================
+         # [0, req.cached_len)                       This part is valid for attention kernel read/write.
+         # [0, old_handle.cached_len)                This part is in the prefix cache before prefill.
+@@ -351,6 +916,10 @@
+             # _free_req_slots so nothing double-frees.
+             free_upto = old_handle.cached_len
+             L = req.mamba_last_track_seqlen
++            self._kv_diag(
++                f"fin L={L} free_upto={free_upto} cached={req.cached_len} "
++                f"pi_len={page_indices.numel()}"
++            )
+             if (
+                 L is not None
+                 and 0 < L <= req.cached_len
+@@ -513,6 +1082,122 @@
+         req.mamba_ping_pong = None
+         req.linear_slot_idx = None
+ 
++    def _kv_diag(self, tag: str) -> None:
++
++        """Optional page-accounting trace (FREETOKEN_KV_DIAG=1) written straight to a file:
++
++        `gap` must stay 0; a non-zero gap right after a cache_req pinpoints the leaking path."""
++
++        if os.environ.get("FREETOKEN_KV_DIAG", "0") != "1":
++
++            return
++
++        try:
++
++            pc = self.prefix_cache
++
++            if self.is_hybrid:
++
++                tree_pages = (pc.full_evictable + pc.full_protected) // self.page_size
++
++            else:
++
++                tree_pages = pc.size_info.total_size // self.page_size
++
++            free_pages = len(self.free_slots)
++
++            with open(r"C:\AI_Models\logs\kv_diag.log", "a", encoding="utf-8") as fh:
++
++                fh.write(
++
++                    f"{tag} free={free_pages} tree={tree_pages} "
++
++                    f"gap={self.num_pages - free_pages - tree_pages}"
++
++                    + (
++
++                        f" mambae={pc.mamba_evictable} mambap={pc.mamba_protected}"
++
++                        f" poolfree={self.linear_state_pool.num_free_slots}"
++
++                        if self.is_hybrid
++
++                        else ""
++
++                    )
++
++                    + "\n"
++
++                )
++
++        except Exception:
++
++            pass
++
++    def _tree_page_starts(self) -> set:
++
++        """Page-start token indices currently owned by the radix tree (all live nodes)."""
++
++        pages = set()
++
++        root = getattr(self.prefix_cache, "root_node", None)
++
++        if root is None:
++
++            return pages
++
++        stack = [root]
++
++        while stack:
++
++            node = stack.pop()
++
++            if not node.is_root():
++
++                try:
++
++                    pages.update(int(x) for x in node.value[:: self.page_size].tolist())
++
++                except Exception:
++
++                    pass
++
++            stack.extend(list(node.children.values()))
++
++        return pages
++
++    def _recycle_orphan_pages(self) -> int:
++
++        """Idle-only safety net: a page that is neither free nor owned by the tree was orphaned
++
++        (a request that died mid-abort). Recycle it instead of killing the server."""
++
++        tree = self._tree_page_starts()
++
++        free = {int(x) for x in self.free_slots.tolist()}
++
++        total = self.num_pages * self.page_size
++
++        orphan = [p for p in range(0, total, self.page_size) if p not in tree and p not in free]
++
++        if not orphan:
++
++            return 0
++
++        self.free_slots = torch.cat(
++
++            [
++
++                self.free_slots,
++
++                torch.tensor(orphan, dtype=self.free_slots.dtype, device=self.free_slots.device),
++
++            ]
++
++        )
++
++        return len(orphan)
++
+     def check_integrity(self) -> None:
+         if self.is_hybrid:
+             pc = self.prefix_cache
+@@ -545,11 +1230,19 @@
+             self.prefix_cache.check_integrity()
+             cache_pages = self.prefix_cache.size_info.total_size // self.page_size
+         if len(self.free_slots) + cache_pages != self.num_pages:
+-            raise RuntimeError(
+-                "CacheManager integrity check failed:"
+-                f" free_pages({len(self.free_slots)}) +"
+-                f" cache_pages({cache_pages}) != num_pages({self.num_pages})"
++            before = len(self.free_slots)
++            repaired = self._recycle_orphan_pages()
++            logger.warning(
++                f"cache page accounting gap: free({before}) + tree({cache_pages}) != "
++                f"total({self.num_pages}); recycled {repaired} orphan page(s) -> "
++                f"free({len(self.free_slots)})"
+             )
++            if len(self.free_slots) + cache_pages != self.num_pages:
++                raise RuntimeError(
++                    "CacheManager integrity check failed:"
++                    f" free_pages({len(self.free_slots)}) +"
++                    f" cache_pages({cache_pages}) != num_pages({self.num_pages})"
++                )
+         if self.page_size > 1:
+             assert torch.all(self.free_slots % self.page_size == 0)
+ 
+@@ -565,7 +1258,46 @@
+         self.num_pages = num_pages
+         self.page_table = page_table
+         self.free_slots = torch.arange(num_pages, dtype=torch.int32, device=device) * self.page_size
++        dropped_mamba = 0
++
++        if self.is_hybrid:
++
++            _pc = self.prefix_cache
++
++            dropped_mamba = _pc.mamba_evictable_size + _pc.mamba_protected
++
++            logger.warning(
++
++                f"rebuild drops {dropped_mamba} mamba snapshot(s) "
++
++                "(live tree snapshots at rebuild time): "
++
++                "historical sessions will full-prefill"
++
++            )
++
++            try:
++
++                with open(
++
++                    r"C:\AI_Models\logs\kv_rebuild_warn.log", "a", encoding="utf-8"
++
++                ) as _fh:
++
++                    _fh.write(
++
++                        f"rebuild drops {dropped_mamba} mamba snapshot(s)\n"
++
++                    )
++
++            except OSError:
++
++                pass
++
++
++
+         self.prefix_cache = self._make_prefix_cache(device, self.page_size, self.cache_type)
++        self._attach_evict_hook()
+         # The discarded hybrid tree owned donated GDN-snapshot slots; rebuild is idle-only, so
+         # reclaim the whole LinearStatePool free-list (else those slots leak -> admission hangs).
+         if self.is_hybrid:
+@@ -605,7 +1337,29 @@
+             else:
+                 evicted = self.prefix_cache.evict(need)
+             self.free_slots = torch.cat([self.free_slots, evicted[:: self.page_size]])
+-            assert len(self.free_slots) >= needed_pages, "Eviction did not free enough space."
++            if len(self.free_slots) < needed_pages:
++
++                recycled_pages = 0
++
++                try:
++
++                    recycled_pages = self._recycle_orphan_pages()
++
++                except Exception:
++
++                    pass
++
++                if len(self.free_slots) < needed_pages:
++
++                    raise KVAllocationError(
++
++                        f"KV pool exhausted: need {needed_pages} page(s), have "
++
++                        f"{len(self.free_slots)} after eviction (+{recycled_pages} orphan "
++
++                        f"recycled), total {self.num_pages}"
++
++                    )
+         allocated = self.free_slots[:needed_pages]
+         self.free_slots = self.free_slots[needed_pages:]
+         return allocated

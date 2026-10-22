@@ -1,0 +1,53 @@
+--- a/scheduler/prefill.py
++++ b/scheduler/prefill.py
+@@ -88,6 +88,34 @@
+         if estimated_size + self.reserved_size > self.cache_manager.available_size:
+             return self.cache_manager.unlock(handle)
+ 
++        if self.cache_manager.host_store is not None:
++            # The host/SSD tier stores one entry per radix node (each with its own kv_start),
++            # so keep extending until no entry continues the prefix we already hold.
++            try:
++                while True:
++                    extended = self.cache_manager.attempt_host_restore(req.input_ids, handle)
++                    if extended is handle:
++                        break
++                    handle = extended
++                    # Stop extending once the pool can no longer fit the request itself:
++                    # a half-restored prefix would reserve pages and starve prefill forever.
++                    need = self._kv_reservation_size(
++                        req.input_len + req.output_len, handle.cached_len
++                    )
++                    if need + self.reserved_size > self.cache_manager.available_size:
++                        break
++            except Exception as exc:  # noqa: BLE001 - host restore is an optimization, never fatal
++                logger.warning(f"host KV restore failed, falling back to GPU prefix: {exc!r}")
++            # A host restore lengthens the prefix past the GPU match, so the KV reservation
++            # has to be recomputed; keep the lock (attempt_host_restore migrated it).
++            cached_len = handle.cached_len
++            extend_len = req.input_len - cached_len
++            estimated_size = self._kv_reservation_size(
++                req.input_len + req.output_len, cached_len
++            )
++            if estimated_size + self.reserved_size > self.cache_manager.available_size:
++                return self.cache_manager.unlock(handle)
++
+         # Second currency (hybrid GDN): reserve 1 live + 2 ping-pong state slots; evict tree
+         # snapshots if the pool is short, fail admission if still short (mirrors the KV gate).
+         if self.cache_manager.is_hybrid:
+@@ -130,7 +158,14 @@
+             linear_slot_idx = pool.alloc(1)[0]
+             ping_pong = tuple(pool.alloc(2))
+ 
+-        return handle, table_idx, linear_slot_idx, ping_pong, mr.mamba_value
++        # A host restore lengthens the prefix past the original match, so the GDN snapshot to
++        # COW into the live slot must come from the FINAL node. Using mr.mamba_value here would
++        # pair a long KV prefix with the shorter prefix's recurrent state (or with a stale slot
++        # when the GPU match was empty) -- the model then "remembers" the wrong prefix.
++        mamba_value = getattr(handle.node, "mamba_value", None)
++        if mamba_value is None:
++            mamba_value = mr.mamba_value
++        return handle, table_idx, linear_slot_idx, ping_pong, mamba_value
+ 
+     def _add_one_req(
+         self,

@@ -1,0 +1,49 @@
+--- a/kvcache/qsa_pool.py
++++ b/kvcache/qsa_pool.py
+@@ -205,6 +205,46 @@
+         assert self._rope_positions is not None, "rope positions are only kept on mrope models"
+         return self._rope_positions
+ 
++    def gather_index_tiers(
++        self, slots: torch.Tensor
++    ) -> tuple[torch.Tensor, torch.Tensor | None]:
++        """Compressed index-key rows and mrope positions of ``slots`` (page-aligned token slots).
++
++        The index slab is a 1/ratio shadow of the K/V pages, so it is NOT part of
++        ``gather_kv``; an SSD round-trip has to carry it separately, otherwise restored
++        pages score against zero rows and long-context sparse selection breaks."""
++        idx = slots.to(device=self._device, dtype=torch.long)
++        rows = idx[:: self._index_ratio] // self._index_ratio
++        cmp_rows = self._cmp_k_buffer.index_select(1, rows).clone()
++        rope_rows = (
++            self._rope_positions.index_select(0, idx).clone()
++            if self._rope_positions is not None
++            else None
++        )
++        return cmp_rows, rope_rows
++
++    def scatter_index_tiers(
++        self,
++        slots: torch.Tensor,
++        cmp_rows: torch.Tensor | None,
++        rope_rows: torch.Tensor | None,
++    ) -> None:
++        idx = slots.to(device=self._device, dtype=torch.long)
++        if cmp_rows is not None:
++            rows = idx[:: self._index_ratio] // self._index_ratio
++            if cmp_rows.shape[1] != rows.numel():
++                raise ValueError(
++                    f"index tier size mismatch: {cmp_rows.shape[1]} rows "
++                    f"for {rows.numel()} groups"
++                )
++            self._cmp_k_buffer.index_copy_(
++                1, rows, cmp_rows.to(device=self._device, dtype=self._index_dtype)
++            )
++        if rope_rows is not None and self._rope_positions is not None:
++            self._rope_positions.index_copy_(
++                0, idx, rope_rows.to(device=self._device, dtype=self._rope_positions.dtype)
++            )
++
+     @property
+     def cmp_scratch_base(self) -> int:
+         """First scratch row of ``cmp_k_cache``; row ``cmp_scratch_base + table_idx`` sinks a

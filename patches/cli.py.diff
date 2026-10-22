@@ -1,0 +1,16 @@
+--- a/cli.py
++++ b/cli.py
+@@ -28,7 +28,12 @@
+ def _run_serve(argv: list[str]) -> int:
+     from freetoken.server import launch_server
+ 
+-    launch_server(argv=argv, prog="ft serve")
++    try:
++        launch_server(argv=argv, prog="ft serve")
++    except KeyboardInterrupt:
++        # Windows CTRL_C_EVENT: uvicorn re-raises the captured signal after the app has
++        # already shut down cleanly, so this is an expected exit, not an error.
++        return 130
+     return 0
+ 
+ 
