@@ -1,6 +1,6 @@
 --- a/scheduler/cache.py
 +++ b/scheduler/cache.py
-@@ -7,7 +7,9 @@
+@@ -7,7 +7,13 @@
  import torch
  from freetoken.core import Req
  from freetoken.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
@@ -8,10 +8,14 @@
 +from freetoken.utils import align_down, div_ceil, init_logger
 +
 +logger = init_logger(__name__)
++
++# Read once: FREETOKEN_KV_DIAG / FREETOKEN_KV_RESTORE_VERIFY are start-time flags.
++
++_KV_DIAG_ENABLED = os.environ.get("FREETOKEN_KV_DIAG", "0") == "1"
  
  if TYPE_CHECKING:
      from .utils import PendingReq
-@@ -28,10 +30,30 @@
+@@ -28,10 +34,30 @@
  # the client drops reasoning (Qwen's "<think>\n": the re-render diverges 2 tokens BEFORE P).
  _SWA_RETAIN_GAP = 16
  
@@ -43,7 +47,7 @@
          # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
          # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
          device = page_table.device
-@@ -42,6 +64,8 @@
+@@ -42,6 +68,8 @@
          # the plain naive/radix path.
          self.linear_state_pool = linear_state_pool
          self.swa_pool = swa_pool
@@ -52,7 +56,7 @@
          self.sliding_window_size = sliding_window_size
          self.is_hybrid = type == "hybrid_radix"
          self.is_swa = type == "swa_radix"
-@@ -61,6 +85,69 @@
+@@ -61,6 +89,69 @@
          self.page_table = page_table
          self.page_size = page_size
          self.cache_type = type
@@ -122,7 +126,7 @@
  
      # ----- capability hooks (defaults; plugged-in pools may narrow them) -----
      supports_runtime_rebuild = True
-@@ -109,6 +196,462 @@
+@@ -109,6 +200,462 @@
              return MatchResult(
                  HybridCacheHandle(m.cached_len, m.node, m.kv_indices), mamba_value=m.mamba_value)
          return self.prefix_cache.match_prefix(ids)
@@ -585,7 +589,7 @@
  
      @property
      def available_size(self) -> int:
-@@ -272,7 +815,19 @@
+@@ -272,7 +819,19 @@
                  needed_pages += last_page - first_page
                  allocation_info.append((req.table_idx, first_page, last_page))
          if needed_pages > 0:
@@ -606,7 +610,7 @@
              if self.swa_paged:
                  # Each newly-allocated full token needs a swa-pool slot (where its SWA-layer KV is
                  # written; read back via the full->swa mapping). radix reuses the existing prefix's
-@@ -287,7 +842,17 @@
+@@ -287,7 +846,17 @@
          if self.is_swa:
              return self._cache_req_swa(req, finished=finished)
          if self.is_hybrid:
@@ -625,7 +629,7 @@
          # ==================================== valid cache region ====================================
          # [0, req.cached_len)                       This part is valid for attention kernel read/write.
          # [0, old_handle.cached_len)                This part is in the prefix cache before prefill.
-@@ -351,6 +916,10 @@
+@@ -351,6 +920,10 @@
              # _free_req_slots so nothing double-frees.
              free_upto = old_handle.cached_len
              L = req.mamba_last_track_seqlen
@@ -636,7 +640,7 @@
              if (
                  L is not None
                  and 0 < L <= req.cached_len
-@@ -513,6 +1082,122 @@
+@@ -513,6 +1086,122 @@
          req.mamba_ping_pong = None
          req.linear_slot_idx = None
  
@@ -646,7 +650,7 @@
 +
 +        `gap` must stay 0; a non-zero gap right after a cache_req pinpoints the leaking path."""
 +
-+        if os.environ.get("FREETOKEN_KV_DIAG", "0") != "1":
++        if not _KV_DIAG_ENABLED:
 +
 +            return
 +
@@ -759,7 +763,7 @@
      def check_integrity(self) -> None:
          if self.is_hybrid:
              pc = self.prefix_cache
-@@ -545,11 +1230,19 @@
+@@ -545,11 +1234,19 @@
              self.prefix_cache.check_integrity()
              cache_pages = self.prefix_cache.size_info.total_size // self.page_size
          if len(self.free_slots) + cache_pages != self.num_pages:
@@ -783,7 +787,7 @@
          if self.page_size > 1:
              assert torch.all(self.free_slots % self.page_size == 0)
  
-@@ -565,7 +1258,46 @@
+@@ -565,7 +1262,46 @@
          self.num_pages = num_pages
          self.page_table = page_table
          self.free_slots = torch.arange(num_pages, dtype=torch.int32, device=device) * self.page_size
@@ -830,7 +834,7 @@
          # The discarded hybrid tree owned donated GDN-snapshot slots; rebuild is idle-only, so
          # reclaim the whole LinearStatePool free-list (else those slots leak -> admission hangs).
          if self.is_hybrid:
-@@ -605,7 +1337,29 @@
+@@ -605,7 +1341,29 @@
              else:
                  evicted = self.prefix_cache.evict(need)
              self.free_slots = torch.cat([self.free_slots, evicted[:: self.page_size]])

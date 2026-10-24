@@ -32,7 +32,6 @@ $env:FREETOKEN_KV_PERSIST_DIR = "C:\Users\X303\Documents\FreetokenP\kv_persist"
 $env:FREETOKEN_KV_PERSIST_BYTES = "68719476736"
 # 暂时关闭 SSD 恢复（restore 路径有页归属问题，待修复）
 # SSD 恢复默认开启；关闭：$env:FREETOKEN_KV_RESTORE = "0"
-$env:FREETOKEN_KV_DIAG = "0"
 $env:FREETOKEN_KV_RESTORE_VERIFY = "0"
 # MoE 侧流拷贝（免费提速）；measure 会掉 ~25% 吞吐，生产保持 off
 $env:FREETOKEN_MOE_COPY_OVERLAP = "1"
@@ -60,7 +59,7 @@ $arguments = @(
     "--moe-cpu-layers", "auto",
     "--text-model-only",
     "--memory-ratio", "0.95",
-    "--num-tokens", "103040",
+    "--num-tokens", "92160",
     "--max-running-requests", "1",
     "--moe-cpu-threads", "32",
     "--host", "127.0.0.1",
@@ -72,7 +71,7 @@ $arguments = @(
 # makes tqdm think it is not a terminal and print one line per update. A transcript keeps
 # a log file without touching the child's console handles, so tqdm refreshes in place.
 # Boot with the auto MoE geometry (1234 slots, prefill overlap ON) so the engine allocates
-# the two full expert-layer buffers, then rebuild to 512 slots / 103040-token KV / 4 mamba
+# the two full expert-layer buffers, then rebuild to 512 slots / 98304-token KV / 4 mamba
 # slots once the server is ready. Starting directly with "--moe-cache-size 512
 # --disable-moe-prefill-overlap" only allocates ONE buffer and makes prefill ~5x slower.
 Start-Process powershell -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',

@@ -819,3 +819,81 @@ space."` —— 进程会因 assert 直接死。改为：
   `num_pages*1622016 + mamba*115642376 ≤ 3177893888`。
 - 待决：是否引入"按场景切换几何"（启动参数 / 客户端设置：长文档模式 ↔ 多会话模式），
   还是固定折中（如 KV ~90k + mamba 8）。需要真实工作负载的会话长度分布数据再拍板。
+
+
+## 阶段十七：定位并解决 compact/长上下文掉速（根因＝mamba-on-evict 钩子）（2026-10-23）
+
+### 现象
+- 用户长会话（prompt 80k~97k）：**compact（新前缀冷 prefill）掉到 ~350 t/s**；**稳态 decode 掉到 17.5 / 6.9 t/s**（0.3.1 同配置 24~30，0.2.0 原版 30）。
+- worker **持续占 ~2 个核（CPU 83%）**，GPU 100%，服务不崩。
+
+### 关键证据（`C:\AI_Models\logs\mamba_evict.log`，新加的文件日志）
+在 compact 的两秒内（10:52:01–02）触发 **3 个 burst、16 次 `capture_evicted_mamba`**，每 burst 5~6 个节点、单次 0~32 ms、burst 累计 **64~139 ms**：
+```
+10:52:01 store 40896 tok 0.0 ms burst#1
+10:52:01 store 58368 tok 16.0 ms burst#2
+...
+10:52:02 store 75264 tok 31.0 ms burst#6 total 139.0 ms
+```
+机制：compact/长前缀 ⇒ KV 池大量换页 ⇒ 驱逐连片 ⇒ **钩子每驱逐一个节点就同步拷 110 MiB GDN 快照**，直接串在热路径上。
+
+### 一次性拆分验证（干净基线）
+配置：`103040 KV / mamba 4 / moe 512` ＋ **`FREETOKEN_KV_SWAP_MAMBA_ON_EVICT=0`**（= 用户 0.3.1 等价，仅引擎为 0.2.0）
+| 指标 | 修复前 | 修复后 |
+| --- | --- | --- |
+| 冷 prefill 75.6k | ~350（compact）/1764 | **1794 t/s** |
+| 模拟 compact 97.9k 新前缀 | **350** | **1814 t/s** |
+| 长上下文 decode 75.6k | 17.5 / 6.9 | **29.4 t/s** |
+| CPU load | 83%（~2 核） | **16%** |
+| `mamba_evict.log` | 密集 | **无** |
+
+### 结论（修正前面判断）
+- **不是 mamba 槽位不够**：mamba 4 完全够用，之前"要加到 9"是被钩子带偏。
+- **不需要牺牲 KV**：KV 回到 103040，decode 仍 29.4。
+- **根因只有一个**：`mamba-on-evict` 钩子在驱逐现场做 110 MiB 同步 D2H。
+
+### 最终配置（C+D 双盘已同步）
+`103040 KV / mamba 4 / moe 512`，`FREETOKEN_KV_SWAP_MAMBA_ON_EVICT=0`，
+`FREETOKEN_KV_SWAP_SUPPRESS_ON_COLD_PREFILL=1`（保险，见下）。
+
+### 保留的保险：冷大前缀自动静默（阶段 A）
+新增 `KVHostStore.suppress_for()/is_suppressed()`；`prefill._try_allocate_one` 在
+`cached_len == 0 且 input_len >= FREETOKEN_KV_SUPPRESS_MIN_TOKENS(默认 16384)` 时开一个
+`input_len/1000*1.5+10` 秒的抑制窗口，期间 `capture_node/capture_node_mamba/capture_evicted_mamba/
+capture_resident/attempt_host_restore/_try_reattach_mamba` 全部跳过。
+钩子当前已关（默认），该保险用于"将来若重新开启钩子"时保护 compact。
+
+
+## 阶段十八：审计整改与最终收敛（2026-10-23）
+
+### 五条整改
+1. **① memory-ratio**：0.92 **不可用** —— 它是"引擎可用显存上限"，降到 0.92 把 cache 预算从
+   **4.36 GiB 压到 3.27 GiB** → `90k+512+mamba5`（needs 3.50）被拒 → 退回启动 auto 几何
+   （`moe 1065`，吃显存）→ 冷 prefill 掉到 231、free 仅 214 MiB。**已回 0.95**。
+2. **③ suppress 启发式物理删除**：删掉 `KVHostStore.suppress_for/is_suppressed` + 4 个捕获
+   入口守卫 + `prefill` 冷前缀触发块 + `cache` 两处 restore/reattach 守卫 + ps1 的
+   `FREETOKEN_KV_SWAP_SUPPRESS_ON_COLD_PREFILL`；全仓 `suppress_*` 残留 **0**；C/D 同步。
+3. **⑤ 小修三条**：(a) `_kv_diag` 的 env 读取改模块级 `_KV_DIAG_ENABLED`（不再每次调用读）；
+   (b) `capture_node_mamba` 补 CUDA-graph-capture guard（与 `capture_node` 对齐）；
+   (c) 负缓存清理单测 `tools/test_captured_drop.py` **PASS**（`_captured`/`_mamba_captured`
+   在 SSD drop 时被清，`SSDStore._drop` 调 `_notify_drop`）。
+4. **④ 三个工具**：
+   - `tools/invariant_suite.py` —— 静态 API 存在性 + suppress 无残留 + 小修 + 跑内置单测
+     (+ 可选 live 页账)；当前 **20 项全 PASS**；
+   - `tools/check_sync.py` —— C/D 的 11 个包文件 + 5 个顶层文件 hash 比对；**建好即查出 1 处
+     drift**（`kv-rebuild-after-ready.ps1` 两边不一致，已修，现 OK）；
+   - **preload 计数器** —— `runtime._idle_hooks` 每 30 s 把 `store.summary()` 追加写
+     `C:\AI_Models\logs\kv_preload.log`（子进程 stdout 抓不到，这是唯一可读的
+     "谁在干活"信号）。
+5. **① 重测（收敛）**：`90k / mamba 5 / moe 512 / ratio 0.95` → decode **28.8 / 28.6 / 28.6 /
+   28.6**（4 次极差 0.2），**GPU free 恒定 1295 MiB**（不再收紧）→ **波动收敛**。
+
+### 误删与修复（过程记录）
+删除 suppress 的脚本把 4 个方法的 `def` 行一并删了（`capture_node` / `capture_node_mamba` /
+`capture_evicted_mamba` / `capture_resident`），`py_compile` 不报（裸 docstring 合法），运行时
+会 `NameError`。已全部恢复并 import 验证；`invariant_suite` 现在会检查这几处存在性。
+
+### 最终配置
+`KV 92160 (1440页) / mamba 5 / moe 512 / --memory-ratio 0.95`，
+`FREETOKEN_KV_SWAP_MAMBA_ON_EVICT=0`（钩子关）、`FREETOKEN_KV_SWAP_SUPPRESS_ON_COLD_PREFILL`
+**已删除**。C/D 两盘一致（check_sync OK）。

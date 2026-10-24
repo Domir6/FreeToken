@@ -192,12 +192,27 @@ class KVHostStore:
             self._mamba_burst_ms = 0.0
         self._mamba_burst_count += 1
         self._mamba_burst_ms += dt_ms
+        try:
+            with open(
+                r"C:\AI_Models\logs\mamba_evict.log", "a", encoding="utf-8"
+            ) as _fh:
+                _fh.write(
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} {kind} {n_tokens} tok "
+                    f"{dt_ms:.1f} ms burst#{self._mamba_burst_count} "
+                    f"total {self._mamba_burst_ms:.1f} ms\n"
+                )
+        except OSError:
+            pass
         logger.info(
             f"mamba-on-evict: {kind} {n_tokens} tok in {dt_ms:.1f} ms "
             f"(evict-burst #{self._mamba_burst_count}, total {self._mamba_burst_ms:.1f} ms)"
         )
 
     def capture_node_mamba(self, node) -> bool:
+        if self.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            with self._lock:
+                self.stats["skipped"] += 1
+            return False
         """Eviction-path capture: persist ONLY the GDN snapshot (one D2H), never KV.
 
         The node's KV needs no copy here -- evict_mamba tombstones the node (KV stays in the
@@ -448,6 +463,7 @@ class KVHostStore:
     @property
     def dump_flag_path(self) -> str:
         return os.path.join(self.persist_dir, ".dump_request")
+
 
     def capture_resident(self, cache, max_bytes: int | None = None) -> int:
         """Capture unlocked radix leaves into the host tier WITHOUT evicting them.

@@ -9,7 +9,9 @@ from freetoken.core import Req
 from freetoken.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
 from freetoken.utils import align_down, div_ceil, init_logger
 
-logger = init_logger(__name__)
+logger = init_logger(__name__)
+# Read once: FREETOKEN_KV_DIAG / FREETOKEN_KV_RESTORE_VERIFY are start-time flags.
+_KV_DIAG_ENABLED = os.environ.get("FREETOKEN_KV_DIAG", "0") == "1"
 
 if TYPE_CHECKING:
     from .utils import PendingReq
@@ -815,7 +817,7 @@ class CacheManager:
     def _kv_diag(self, tag: str) -> None:
         """Optional page-accounting trace (FREETOKEN_KV_DIAG=1) written straight to a file:
         `gap` must stay 0; a non-zero gap right after a cache_req pinpoints the leaking path."""
-        if os.environ.get("FREETOKEN_KV_DIAG", "0") != "1":
+        if not _KV_DIAG_ENABLED:
             return
         try:
             pc = self.prefix_cache

@@ -87,7 +87,20 @@ def _idle_hooks(scheduler) -> None:
     now = time.monotonic()
     if now - getattr(scheduler, "_host_store_log_ts", 0.0) > 30.0:
         scheduler._host_store_log_ts = now
-        logger.info_rank0(store.summary())
+        _summary = store.summary()
+        logger.info_rank0(_summary)
+        # Mirror the host-tier counters to a file: they are the only readable signal for
+        # "who is doing the work" (idle-preload coverage vs eviction), since the scheduler
+        # subprocess stdout is not captured by Start-Transcript.
+        try:
+            with open(
+                r"C:\AI_Models\logs\kv_preload.log", "a", encoding="utf-8"
+            ) as _fh:
+                _fh.write(
+                    time.strftime("%Y-%m-%d %H:%M:%S") + " " + _summary + "\n"
+                )
+        except OSError:
+            pass
 
     # SSD persistence is explicit: the stop script writes <persist_dir>/.dump_request and
     # sends one more token; the idle gate below turns that flag into a dump.
