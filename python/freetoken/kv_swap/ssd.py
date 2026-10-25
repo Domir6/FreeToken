@@ -134,6 +134,7 @@ class SSDStore:
                     pass
                 return False
             first = list(entry.tokens[: self.page_size].tolist())
+            kind = getattr(entry, "kind", None) or ("mb" if entry.kv_k is None else "seg")
             meta = {
                 "first": first,
                 "length": entry.length,
@@ -142,6 +143,7 @@ class SSDStore:
                 "bytes": int(size),
                 "atime": time.time(),
                 "mamba_only": entry.kv_k is None,
+                "kind": kind,
             }
             if path not in self._index:
                 self._bytes += int(size)
@@ -170,7 +172,8 @@ class SSDStore:
         cb = getattr(self, "_on_drop", None)
         if cb is not None:
             try:
-                cb(meta.get("sha1"))
+                kind = meta.get("kind") or ("mb" if meta.get("mamba_only") else "seg")
+                cb(meta.get("sha1"), kind)
             except Exception:
                 pass
 
@@ -243,6 +246,7 @@ class SSDStore:
             kv_start=int(data["kv_start"]),
             cmp_index=data.get("cmp_index"),
             rope_pos=data.get("rope_pos"),
+            kind=meta.get("kind") or ("mb" if meta.get("mamba_only") else "seg"),
         )
         if entry.length != int(best_meta["length"]) or not torch.equal(
             ids[: entry.length], entry.tokens
@@ -251,6 +255,56 @@ class SSDStore:
             return None
         with self._lock:
             best_meta["atime"] = time.time()
+            self.stats["loaded"] += 1
+            self._write_index()
+        return entry
+
+    def lookup_session(self, ids: torch.Tensor, signature: str):
+        """Cold-start path in the SSD tier: the exact full-length sess entry for ``ids``."""
+        from freetoken.kv_swap.manager import HostEntry
+
+        with self._lock:
+            self._ensure_dir(signature)
+            key = tuple(ids[: self.page_size].tolist())
+            bucket = list(self._by_first.get(key, ()))
+        digest = _sha1(ids)
+        best_path = None
+        for path in bucket:
+            meta = self._index.get(path)
+            if meta is None or meta.get("kind") != "sess":
+                continue
+            if int(meta["length"]) != ids.numel() or meta["sha1"] != digest:
+                continue
+            best_path = path
+            break
+        if best_path is None:
+            return None
+        try:
+            data = torch.load(best_path, map_location="cpu", weights_only=False)
+        except (OSError, RuntimeError, ValueError):
+            self.stats["failed"] += 1
+            with self._lock:
+                self._drop(best_path)
+            return None
+        if data.get("kv_k") is None:
+            self.stats["dropped"] += 1
+            return None
+        entry = HostEntry(
+            tokens=data["tokens"].to(torch.int64).contiguous(),
+            kv_k=data.get("kv_k"),
+            kv_v=data.get("kv_v"),
+            mamba=data.get("mamba"),
+            kv_start=int(data["kv_start"]),
+            cmp_index=data.get("cmp_index"),
+            rope_pos=data.get("rope_pos"),
+            kind="sess",
+        )
+        meta = self._index.get(best_path)
+        if entry.kv_start != 0 or meta is None or entry.length != int(meta["length"]):
+            self.stats["dropped"] += 1
+            return None
+        with self._lock:
+            meta["atime"] = time.time()
             self.stats["loaded"] += 1
             self._write_index()
         return entry

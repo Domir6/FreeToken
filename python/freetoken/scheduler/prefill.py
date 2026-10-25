@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import os
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Tuple
 
@@ -76,6 +78,42 @@ class PrefillAdder:
         mr = self.cache_manager.match_req(req, max_len=max(0, req.input_len - replay) if replay else None)
         handle = mr.cuda_handle
         cached_len = handle.cached_len
+        # Pressure-triggered snapshot (session snapshot spec, addendum): when free pool
+        # space drops below ~25%, the incoming prefill is about to evict whole sessions.
+        # Capture the largest uncaptured one FIRST (~1-2s) so the eviction becomes an
+        # investment instead of a loss. Sub-agents issue back-to-back requests with no
+        # idle transitions, so the idle hook alone never gets a chance to snapshot them.
+        _hs = self.cache_manager.host_store
+        if _hs is not None:
+            try:
+                _pc2 = self.cache_manager.prefix_cache
+                # TRUE free pages only: available_size counts evictable tree pages as
+                # "available" (admission semantics), so it never drops below 25% and the
+                # pressure trigger never fired. free_slots is the real signal.
+                _free_tokens = len(self.cache_manager.free_slots) * self.cache_manager.page_size
+                _tree_tokens = _pc2.full_evictable + _pc2.full_protected
+                _total_est = _tree_tokens + _free_tokens
+                if (
+                    _total_est > 0
+                    and _free_tokens * 100 < _total_est * 25
+                    and os.environ.get("FREETOKEN_KV_SESS_SNAPSHOT", "1").strip().lower()
+                    not in ("0", "false", "off", "no")
+                ):
+                    from freetoken.kv_swap.manager import _slog
+
+                    _n_before = _hs._sess_stats["captured"]
+                    _hs.capture_sessions(_pc2)
+                    if _hs._sess_stats["captured"] == _n_before:
+                        _slog(f"pressure capture: no new snapshot "
+                              f"(waiting={_hs._sess_stats['sess_waiting']} "
+                              f"tree={_tree_tokens} free={_free_tokens})")
+            except Exception as _exc:  # noqa: BLE001 - snapshot is an optimization
+                try:
+                    from freetoken.kv_swap.manager import _slog
+
+                    _slog(f"pressure capture FAILED: {_exc!r}")
+                except Exception:
+                    pass
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
         estimated_size = self._kv_reservation_size(
@@ -83,15 +121,25 @@ class PrefillAdder:
         )
 
         if estimated_size + self.reserved_size > self.cache_manager.available_size:
+            from freetoken.kv_swap.manager import _slog
+
+            _slog(f"admission FAIL (pre-lock): need={estimated_size} "
+                  f"avail={self.cache_manager.available_size} input={req.input_len}")
             return None
         self.cache_manager.lock(handle)
         if estimated_size + self.reserved_size > self.cache_manager.available_size:
+            from freetoken.kv_swap.manager import _slog
+
+            _slog(f"admission FAIL (locked): need={estimated_size} "
+                  f"avail={self.cache_manager.available_size} input={req.input_len}")
             return self.cache_manager.unlock(handle)
 
         if self.cache_manager.host_store is not None:
             # The host/SSD tier stores one entry per radix node (each with its own kv_start),
             # so keep extending until no entry continues the prefix we already hold.
             try:
+                _pre = handle.cached_len
+                _t_restore = time.monotonic()
                 while True:
                     extended = self.cache_manager.attempt_host_restore(req.input_ids, handle)
                     if extended is handle:
@@ -104,6 +152,10 @@ class PrefillAdder:
                     )
                     if need + self.reserved_size > self.cache_manager.available_size:
                         break
+                from freetoken.kv_swap.manager import _slog
+
+                _slog(f"restore final: cached={handle.cached_len}/{req.input_len} "
+                      f"(was {_pre}) took={(time.monotonic() - _t_restore) * 1000:.0f}ms")
             except Exception as exc:  # noqa: BLE001 - host restore is an optimization, never fatal
                 logger.warning(f"host KV restore failed, falling back to GPU prefix: {exc!r}")
             # A host restore lengthens the prefix past the GPU match, so the KV reservation

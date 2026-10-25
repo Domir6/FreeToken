@@ -1,6 +1,6 @@
 param(
     [int]$Port = 1919,
-    [int]$TimeoutSec = 8,
+    [int]$TimeoutSec = 60,
     [string]$KvPersistDir = "C:\Users\X303\Documents\FreetokenP\kv_persist",
     [switch]$Force
 )
@@ -139,8 +139,25 @@ else {
             Write-Output "Port $Port released after graceful shutdown."
         }
         else {
-            Write-Output "Graceful stop timed out; terminating the process tree."
-            [void](Stop-Tree -RootPid $root)
+            # CTRL_C can stall forever when the core is inside a long C call (big gather /
+            # SSD write during its own shutdown dump). CTRL_BREAK cannot be ignored by
+            # Python on Windows: the process terminates itself cleanly (atexit handlers
+            # still run), which is a step above tree-kill. The KV dump has already been
+            # taken via the flag file, so no data is at risk at this point.
+            Write-Output "Graceful stop timed out; sending CTRL_BREAK_EVENT..."
+            [void][ConsoleCtl]::FreeConsole()
+            if ([ConsoleCtl]::AttachConsole([uint32]$root)) {
+                [void][ConsoleCtl]::SetConsoleCtrlHandler([IntPtr]::Zero, $true)
+                [void][ConsoleCtl]::GenerateConsoleCtrlEvent(1, 0)
+                [void][ConsoleCtl]::FreeConsole()
+            }
+            if (Wait-PortFree -Port $Port -Seconds 15) {
+                Write-Output "Port $Port released after CTRL_BREAK."
+            }
+            else {
+                Write-Output "CTRL_BREAK also timed out; terminating the process tree."
+                [void](Stop-Tree -RootPid $root)
+            }
         }
     }
 }

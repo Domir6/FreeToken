@@ -20,13 +20,19 @@ def main():
     # Build a store without running __init__ (it would need a real kv_pool).
     s = KVHostStore.__new__(KVHostStore)
     s._lock = threading.Lock()
-    s._captured = {"deadbeef"}
-    s._mamba_captured = {"deadbeef"}
+    s._captured = {"seg:deadbeef"}
+    s._mamba_captured = {"mb:deadbeef"}
+    s._sess_captured = {"sess:deadbeef"}
 
     check(hasattr(s, "_on_entry_dropped"), "_on_entry_dropped exists")
-    s._on_entry_dropped("deadbeef")
-    check("deadbeef" not in s._captured, "_captured cleared on SSD drop")
-    check("deadbeef" not in s._mamba_captured, "_mamba_captured cleared on SSD drop")
+    s._on_entry_dropped("deadbeef", "seg")
+    check("seg:deadbeef" not in s._captured, "_captured cleared on SSD drop (seg)")
+    s._on_entry_dropped("deadbeef", "mb")
+    check("mb:deadbeef" not in s._mamba_captured, "_mamba_captured cleared on SSD drop (mb)")
+    s._on_entry_dropped("deadbeef", "sess")
+    check("sess:deadbeef" not in s._sess_captured, "_sess_captured cleared on SSD drop (sess)")
+    check(s._captured == set() and s._mamba_captured == set() and s._sess_captured == set(),
+          "keyspaces are isolated: only the dropped kind's set was touched, all cleared now")
     # None / empty must be a no-op (not raise)
     s._on_entry_dropped(None)
     check(True, "None sha1 is a safe no-op")

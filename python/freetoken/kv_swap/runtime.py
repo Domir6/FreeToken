@@ -34,16 +34,82 @@ def _boot(msg: str) -> None:
         pass
 
 
+def _mem_probe() -> str:
+    """Free RAM (Win32 GlobalMemoryStatusEx) and free VRAM (torch), both pure reads.
+
+    Attached to the existing 30 s statistics line only — no extra sampling point, no
+    thread, no env. 17-t/s case proved a single axis (RAM) points at the wrong culprit,
+    so both numbers must appear together."""
+    free_ram = 0.0
+    try:
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        st = MEMORYSTATUSEX()
+        st.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            free_ram = st.ullAvailPhys / (1024 ** 3)
+    except Exception:
+        pass
+    free_vram = 0.0
+    try:
+        # nvidia-smi's "memory.free" is the physical-free axis the 17 t/s case demanded
+        # (foreign graphical processes show up here); cudaMemGetInfo reports how much THIS
+        # process may still cudaMalloc, which is ~0 whenever the engine fills its quota
+        # and would read 0.00 forever. Single-GPU deployment: first line is the card.
+        import subprocess
+
+        out = subprocess.run(
+            [r"C:\Windows\System32\nvidia-smi.exe",
+             "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip().splitlines()
+        if out and out[0]:
+            free_vram = float(out[0]) / 1024.0
+    except Exception:
+        try:
+            import torch
+
+            free_vram = torch.cuda.mem_get_info()[0] / (1024 ** 3)
+        except Exception:
+            pass
+    return f"mem freeRAM={free_ram:.1f}GiB freeVRAM={free_vram:.2f}GiB"
+
+
 def dump_kv_to_ssd(scheduler) -> dict:
     """Capture resident prefixes into the host tier, then flush it to SSD. Idle-only."""
     cache_manager = getattr(scheduler, "cache_manager", None)
     store = getattr(cache_manager, "host_store", None) if cache_manager is not None else None
     if store is None:
         return {"status": "unsupported", "captured": 0, "persisted": 0}
+    # ruling 7 (replaces the thread join): land every staged snapshot BEFORE the SSD flush
+    # so a stop-time dump cannot lose ring-resident captures
+    if hasattr(store, "drain_all"):
+        try:
+            store.drain_all()
+        except Exception as exc:  # noqa: BLE001 - never block the dump on staging
+            logger.warning(f"mamba staging drain_all failed: {exc!r}")
     captured = 0
     persisted = 0
-    budget = os.environ.get("FREETOKEN_KV_DUMP_BYTES", "").strip()
-    max_bytes = int(budget) if budget else None
+    # Default budget 1 GiB: a long-lived server fills the host tier (16 GiB), and an
+    # unbounded dump would re-capture every leaf and re-write the whole tier to SSD,
+    # stalling shutdown for minutes (CTRL_C / stop script then miss their graceful
+    # window and fall back to hard-kill). The idle loop already flushes 1 GiB per
+    # 30 s cycle, so the un-flushed residue at stop time is small.
+    budget = os.environ.get("FREETOKEN_KV_SWAP_DUMP_BYTES", "").strip() or str(1 << 30)
+    max_bytes = int(budget)
     if hasattr(store, "capture_resident"):
         try:
             captured = store.capture_resident(
@@ -53,7 +119,7 @@ def dump_kv_to_ssd(scheduler) -> dict:
             logger.warning(f"host KV capture failed: {exc!r}")
     if hasattr(store, "flush_ssd"):
         try:
-            persisted = store.flush_ssd(max_bytes=1 << 62)
+            persisted = store.flush_ssd(max_bytes=max_bytes)
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"host KV SSD flush failed: {exc!r}")
     return {
@@ -76,6 +142,18 @@ def _idle_hooks(scheduler) -> None:
         cache_manager.check_integrity()
     except Exception as exc:  # noqa: BLE001 - page accounting gap is logged, not fatal
         logger.warning(f"cache integrity check: {exc!r}")
+        _boot(f"integrity FAILED: {exc!r}")
+    # Tree-side page accounting vs the pool's used_pages (/v1/stats): a growing gap
+    # between the two is a dirty-eviction (VRAM residue) signature.
+    try:
+        pc = getattr(cache_manager, "prefix_cache", None)
+        if pc is not None:
+            tree_pages = (pc.full_evictable + pc.full_protected) // max(
+                getattr(cache_manager, "page_size", 1), 1)
+            mamba_tree = getattr(pc, "mamba_evictable_size", 0) + getattr(pc, "mamba_protected", 0)
+            _boot(f"integrity: tree_pages={tree_pages} mamba_tree_slots={mamba_tree}")
+    except Exception as _e:
+        _boot(f"integrity probe failed: {_e!r}")
 
     store = getattr(cache_manager, "host_store", None)
     global _idle_count
@@ -87,7 +165,7 @@ def _idle_hooks(scheduler) -> None:
     now = time.monotonic()
     if now - getattr(scheduler, "_host_store_log_ts", 0.0) > 30.0:
         scheduler._host_store_log_ts = now
-        _summary = store.summary()
+        _summary = store.summary() + " | " + _mem_probe()
         logger.info_rank0(_summary)
         # Mirror the host-tier counters to a file: they are the only readable signal for
         # "who is doing the work" (idle-preload coverage vs eviction), since the scheduler
@@ -117,6 +195,51 @@ def _idle_hooks(scheduler) -> None:
                 os.remove(flag)
             except OSError:
                 pass
+
+    # Idle-gated staging drain (spec v1.1 ruling 3): land queued mamba snapshots into the
+    # host store while nobody is waiting; bounded per idle cycle so it never competes for
+    # bandwidth with the preload below. Runs BEFORE the preload: the ring is small and the
+    # queue must not back up into skip_ring_full.
+    drain_max = os.environ.get("FREETOKEN_MAMBA_DRAIN_MAX_PER_IDLE", "4").strip()
+    if hasattr(store, "drain_staging"):
+        try:
+            store.drain_staging(max_tasks=int(drain_max) if drain_max else 4)
+        except Exception as exc:  # noqa: BLE001 - background optimization
+            logger.warning(f"mamba staging drain failed: {exc!r}")
+
+    # Whole-session snapshots (session snapshot spec v1.0): cold-start restore for
+    # entirely evicted sessions. One session per idle transition, hard cap.
+    sess_on = os.environ.get("FREETOKEN_KV_SESS_SNAPSHOT", "1").strip().lower()
+    if sess_on not in ("", "0", "false", "no", "off") and not getattr(
+        scheduler, "_sess_capture_disabled", False
+    ):
+        if now - getattr(scheduler, "_sess_capture_ts", 0.0) > 1.0:
+            scheduler._sess_capture_ts = now
+            try:
+                n_sess = store.capture_sessions(cache_manager.prefix_cache)
+                if n_sess:
+                    logger.info_rank0(
+                        f"session snapshot: captured={n_sess} "
+                        f"waiting={store._sess_stats['sess_waiting']}"
+                    )
+            except Exception as exc:  # noqa: BLE001 - background optimization
+                if "out of memory" in str(exc).lower():
+                    scheduler._sess_capture_disabled = True
+                    _BOOT_LOG_MSG = f"session snapshot disabled after CUDA OOM: {exc!r}"
+                    logger.warning(_BOOT_LOG_MSG)
+                    try:
+                        with open(_BOOT_LOG, "a", encoding="utf-8") as fh:
+                            fh.write(f"{time.strftime('%H:%M:%S')} [sess] {_BOOT_LOG_MSG}\n")
+                    except OSError:
+                        pass
+                else:
+                    _BOOT_LOG_MSG = f"session snapshot failed: {exc!r}"
+                    logger.warning(_BOOT_LOG_MSG)
+                    try:
+                        with open(_BOOT_LOG, "a", encoding="utf-8") as fh:
+                            fh.write(f"{time.strftime('%H:%M:%S')} [sess] {_BOOT_LOG_MSG}\n")
+                    except OSError:
+                        pass
 
     # Pre-stage evictable prefixes into the host tier while nobody is waiting: a later
     # request then evicts them for free instead of paying a synchronous D2H on decode.

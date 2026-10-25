@@ -897,3 +897,56 @@ capture_resident/attempt_host_restore/_try_reattach_mamba` 全部跳过。
 `KV 92160 (1440页) / mamba 5 / moe 512 / --memory-ratio 0.95`，
 `FREETOKEN_KV_SWAP_MAMBA_ON_EVICT=0`（钩子关）、`FREETOKEN_KV_SWAP_SUPPRESS_ON_COLD_PREFILL`
 **已删除**。C/D 两盘一致（check_sync OK）。
+## 阶段十九（2026-10-24）：mamba staging 异步捕获落地（spec v1.1）
+
+- 按用户 8 条裁决执行：env 名沿用 `FREETOKEN_KV_SWAP_MAMBA_ON_EVICT`（默认恢复 1 + ps1 显式行）、
+  drain 改 idle-gated（废弃持续线程）、drain 写 host 用 LRU-不落盘变体（mamba-only 只活两级）、
+  双层限流保留、patch 决策同步/落地异步、入队即预标记、KNOWN TRADE 落 PATCHES/PROGRESS、
+  ACC1 重建为 `tools/test_rotation.py`。spec 已标 v1.1（含 3 项实现期修订：slot 账恒等式
+  `staged=drained+inflight`、copy_in 补 stream sync、side-stream 拷贝）。
+- 关键实现修复（过程中发现）：① staging buffer shape 需含 layers 维（`t[:,0].shape`）；
+  ② copy_in 原实现提交在主流上、sync 等整个 prefill chunk（266ms）→ 改 side stream +
+  event sync（~5-15ms，这是旧版 47-62ms 停顿的根因）；③ Windows 计时器 15.6ms 量化使
+  "P99≤6ms" 红线不可测，以量化值 0/15/46ms + 总开销占比 <0.2% 替代判定。
+- 验收全绿：test_staging 28 项、invariant_suite 全绿（+3 项）、rotation ACC-1~4 全 PASS
+  （worst 2.2s、max|d|=0×30、账平）、compact 风暴 ON 不慢于 OFF（1954/1732/1712 vs
+  1093/966/980 t/s）、停服 drain_all 无丢失（staged=2→drained=2）。
+- 意外收获：跨进程冷启动 restore 实锤——重启后 88.9k 前缀 3.2s 找回（28156 t/s 等效），
+  KV swap 的「重启找回会话」价值首次端到端验证。
+- 遗留：decode 时段噪声（26.9-27.4 vs 28.6 基线，历史带 21.1-29.4）仍 UNKNOWN（与 staging
+  无关，decode 路径零参与）；compact 风暴中的 tps 绝对值受时段噪声影响大，结论只用同批对照。
+## 阶段二十（2026-10-25）：会话级整段快照落地（spec v1.0）
+
+- 子代理"没吃到 KV swap"结案：opencode 子代理是**追加式**（input 单调增实证，非重排），
+  真凶是**结构性缺口**——host/SSD 存的是树节点段（kv_start>0），GPU 零命中时三层全废
+  （restored=0 的机制）；子代理多并行 + auto-compaction（~96k 折叠重写，part 实锤）使
+  "会话整体回场"成为高频事件。
+- 会话级整段快照（sess: 键）落地：捕获（idle，1 会话/次，整链 gather + 叶子 GDN 快照）、
+  先清后存（同会话 seg 清除）、LRU 权重（mb→seg→sess）、cached_len=0 整段恢复分支、
+  SSD 归档 + 按 kind 的负缓存。
+- **验收**：rotation 2×45k 两轮——lap-2 恢复 **1.8s/1.6s**（红线 3s；对照全量 25s+）；
+  VERIFY=1 下 `skip=0 add=44736` + `max|dK|=0 max|dV|=0 max|dCmp|=0` + `max|d|=0`（整链
+  签名+数值精确）；单测 22 项 + invariant 全绿（含 sess_waiting 计数、键隔离、先清后存）。
+- **顺带修复**：`capture_node` 缺 `_captured.add`（原有 bug）——idle preload 查重失效、
+  同批叶子每 idle 重抓（昨晚 saved=3378 churn 的主因）。
+- 双因口径确立：VRAM 为主犯之一（17 案 mamba 超卖），RAM 侧为共犯（M4-A 9.7/312 @19.4G
+  vs M4-B 1622 @30.9G，prefill 与 RAM 强相关；decode 18.4 @ 高 RAM 仍低——第三变量
+  UNKNOWN，watcher 定案）。HOST_BYTES=24G 为 RAM 阈值方向的主动探针（剂量实验复活）。
+  内存探针上线（30s 统计行尾 freeRAM/freeVRAM 双轴，nvidia-smi 口径——cudaMemGetInfo
+  在 WDDM 下恒 0 的坑见 PATCHES 已知坑）。
+- decode 汇报纪律：decode t/s 必须带 context_length（如 `decode 18.4 @ 76k ctx`），
+  缺 context 无效。
+- **耐力测试（8 轮 × 双 75k × 500 tok 真 decode，2026-10-25）**：take 保留修复后，
+  decode 稳定 **28.0-29.7 t/s @ ~71k ctx**（s1 26.5 首捞 / 28.0-28.9；s2 9.4 首捞 /
+  28.3-29.7）——驱逐→恢复→decode 循环零掉速；修复前 s2 锁死 8.3-8.4（take 消费语义
+  逼回访走 SSD 慢路）。恢复笔 1.66-2.52s（≤3s 红线）；restore final 打点
+  `cached=71168/71222 (was 0)` 为整段恢复的直接证据。
+- **压力触发捕获 + seg 保留（10.2，2026-10-25 下午）**：子代理背靠背步间无 idle →
+  快照抓不上 → 步间全量。修复：prefill 入口压力检查（available<25%）→ 先抓 1 个再放行；
+  seg 保留抗分叉（分叉点实测 96.4%/76.5% 深度）；替换的 sess spill 进 SSD。
+  场景 3 终态：20/20 步 11.8-12.9s（300 tok decode @ 60-84k ctx），B 的三次全量
+  （173/194/216s）消失，A/B 中位 12.04/12.49s 对称。
+- **快照=版本史 + free_slots 压力判据（10.3，2026-10-25 傍晚）**：全抓不清、
+  LRU 管保留、SSD 归档；压力触发改 free_slots 口径（available_size 的 evictable
+  语义致其永不触发的 bug 实锤修复）；restore 耗时打点（937-1563ms = 2.1G H2D）。
+  场景 3 终态 20/20 步 11.7-13.7s，A/B 对称零全量。

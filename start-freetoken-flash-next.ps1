@@ -16,16 +16,27 @@ try {
 # tqdm 保持启用：输出不经管道/重定向，stderr 直连控制台，进度条原地刷新到 100%
 $env:TQDM_MININTERVAL = "0.1"
 
+# ---- 访问令牌（如需把 1919 暴露到公网/局域网）：从同目录 .api_key 读取 ----
+# FreeToken 会读 $env:FREETOKEN_API_KEY 并要求除 /health 外的所有路由带 Bearer/x-api-key。
+# 文件不存在则不开启认证。.api_key 已被 .gitignore 忽略，不要提交。
+$apiKeyFile = Join-Path $PSScriptRoot ".api_key"
+if (Test-Path -LiteralPath $apiKeyFile) {
+    $env:FREETOKEN_API_KEY = (Get-Content -LiteralPath $apiKeyFile -Raw).Trim()
+    Write-Host " API key: loaded from .api_key (auth ENABLED)" -ForegroundColor Green
+}
+
 # ---- 隔离补丁层 + KV 三层缓存 ----
 # 让 freetoken 的纯 Python 模块优先从本目录加载（scheduler / layers / moe / kv_swap ...）
 $env:PYTHONPATH = "C:\Users\X303\Documents\FreetokenP;$env:PYTHONPATH"
 # GPU KV -> pinned host 内存 -> SSD
 # KV swap + SSD 持久化默认开启；如需关闭，取消下一行注释并设为 "0"
 # $env:FREETOKEN_KV_SWAP = "0"
-$env:FREETOKEN_KV_SWAP_HOST_BYTES = "17179869184"
+$env:FREETOKEN_KV_SWAP_HOST_BYTES = "8589934592"
 $env:FREETOKEN_KV_SWAP_MIN_TOKENS = "256"
 $env:FREETOKEN_KV_SWAP_PIN = "0"
 $env:FREETOKEN_KV_SWAP_COPY_CHUNK = "2048"
+# 驱逐前 mamba 快照落盘（pinned staging 异步版）：默认开；设 0 回退到“丢弃”行为
+$env:FREETOKEN_KV_SWAP_MAMBA_ON_EVICT = "1"
 # SSD 持久化（每个请求结束的 idle 立即落盘）
 # SSD 落盘默认开启；关闭：$env:FREETOKEN_KV_PERSIST = "0"
 $env:FREETOKEN_KV_PERSIST_DIR = "C:\Users\X303\Documents\FreetokenP\kv_persist"
@@ -58,8 +69,8 @@ $arguments = @(
     "--moe-strategy", "auto",
     "--moe-cpu-layers", "auto",
     "--text-model-only",
-    "--memory-ratio", "0.95",
-    "--num-tokens", "92160",
+    "--memory-ratio", "0.92",
+    "--num-tokens", "87040",
     "--max-running-requests", "1",
     "--moe-cpu-threads", "32",
     "--host", "127.0.0.1",

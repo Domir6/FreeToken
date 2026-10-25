@@ -20,8 +20,16 @@ see [PROGRESS.md](./PROGRESS.md) for full details):
 - KV cache swap to host RAM / SSD with cross-restart session restore
 - Restore-path completeness: persist QSA `_cmp_k_buffer` /
   `_rope_positions` alongside KV (long-context restore correctness)
-- Mamba/GDN snapshot capture-before-evict: slot eviction degrades to
-  host/SSD restore instead of permanent session loss
+- Mamba/GDN snapshot capture-before-evict (async pinned-staging, v1.1):
+  slot eviction degrades to host/SSD restore instead of permanent session
+  loss; capture cost ~5-15ms vs 47-62ms synchronous
+- Session-level whole-chain snapshots: captured at every decode end (GDN+QSA
+  naturally aligned) plus idle and pressure triggers; immutable version
+  history (retention via host LRU, superseded snapshots demoted to the SSD
+  archive); supports revert-then-resend and rollback-before-compaction
+- Restore paths: whole-chain (skip=0), seg-extend partial restore below
+  client divergence points (dynamic toolset / EOS re-rendering), prefix-view
+  restore, mamba re-attach without blocking KV extension
 - Idle-time KV preload, page-accounting hardening, session-colored logs
 - MoE: shared-expert side-stream overlap (#678-style), router lookahead measure
 - Windows-oriented: portable fat deployment, patched venv workflow
@@ -37,15 +45,64 @@ performs final verification on real hardware. Corrections are welcome
 
 **Known limitations (GDN snapshot layer):**
 
-- Geometry changes / cache rebuilds drop all live GDN snapshots
-  (a warning is logged; affected sessions fall back to host/SSD
-  restore instead of fast resume)
-- Restore needs a free mamba slot; when the pool is full the request
-  degrades to full prefill rather than queueing forever
+- Geometry changes / cache rebuilds rebuild the host store; SSD archives
+  survive across geometries (the signature excludes page count) and restore
+  on demand
+- Restore allocates a mamba slot on demand (up to the engine cap); the
+  request degrades to full prefill rather than queueing forever
 - GDN far-context recall degrades with sequence length — this is
   architecture-inherent and not fixable at the serving layer
 - Mamba slots and KV pages share one VRAM budget: raising the
   concurrent-session limit shortens max context length and vice versa
+- Client-side prefix divergence (dynamic toolset per agent, EOS re-rendering,
+  compaction rewrites) truncates reusable prefixes; seg-extend partial
+  restore covers the intact head (typically 80-99%)
+- Decode has a rare, not-yet-root-caused slowdown (~18 t/s @ ~71k ctx vs
+  28-30 baseline) correlated with RAM headroom and WDDM memory pressure;
+  under investigation via the watcher data
+- VRAM accounting has three disagreeing views (CUDA / nvidia-smi / D3DKMT);
+  driver-private overhead ~0.5-0.8G is invisible to nvidia-smi — plan
+  headroom as nvidia-smi-free minus 0.5G
+
+## Performance (measured on this fork)
+
+RTX 5080 16G, Qwen3.8-Flash-Next-NVFP4, 1360-page (87,040 tok) KV pool,
+mamba 4, moe 512, `--memory-ratio` 0.92-0.95:
+
+| Scenario | Result |
+|---|---|
+| Cold prefill (75k, healthy RAM) | ~1783 tok/s |
+| Cold prefill (RAM-pressured) | degrades to 312-1167 tok/s (restart restores) |
+| Session restore after eviction | 1.6-2.5s (vs 25s+ full prefill), `max|d|=0` |
+| Decode after restore | 28-31 t/s @ ~71k ctx (no penalty) |
+| Endurance: 8 laps × 2×75k × 500 tok decode | 28.0-29.7 t/s, drift ≤5% |
+| Restore instrumentation | `restore final: cached=71168/71222 took=937-1563ms` |
+| Sub-agent burst (back-to-back, 20 steps) | zero full refills; median 12.2/12.5s per 300-tok step |
+
+Decode t/s is always reported **with context length**; numbers without ctx
+are not comparable.
+
+## Current configuration (production)
+
+```
+--moe-strategy auto --moe-cpu-layers auto --text-model-only
+--memory-ratio 0.92..0.95     # experiment: 0.92 (C) / 0.93 (D)
+--num-tokens 87040            # 1360 pages × 64
+--moe-cpu-threads 32 --max-running-requests 1
+# watcher body: {"moe_cache_size":512,"num_pages":1360,"num_mamba_slots":4}
+```
+
+Key environment variables:
+
+| Variable | Value | Purpose |
+|---|---|---|
+| `FREETOKEN_KV_SWAP_HOST_BYTES` | 24 GiB | host tier budget (probe toward the RAM threshold) |
+| `FREETOKEN_KV_SWAP_MAMBA_ON_EVICT` | 1 | async GDN snapshot on eviction |
+| `FREETOKEN_MAMBA_DRAIN_MAX_PER_IDLE` | 4 | drain tasks per idle cycle |
+| `FREETOKEN_KV_SESS_SNAPSHOT` | 1 | whole-session snapshots (decode-end + pressure) |
+| `FREETOKEN_KV_PERSIST_DIR/_BYTES` | repo dir / 64 GiB | SSD archive |
+| `FREETOKEN_KV_RESTORE_VERIFY` | 0 (test: 1) | bit-exact restore verification |
+| `FREETOKEN_API_KEY` | (optional) | from `.api_key` file; auth on all routes but /health |
 
 All changes are experimental; correctness verified by automated tests
 and hardware-in-the-loop measurement. Use at your own risk.

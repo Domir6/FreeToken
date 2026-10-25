@@ -7,7 +7,7 @@ param([int]$Port = 1919, [string]$LogDir = "C:\AI_Models\logs")
 # so prefill keeps its overlapped expert copies. Starting directly with
 # "--moe-cache-size 512 --disable-moe-prefill-overlap" only allocates one buffer and
 # makes prefill ~5x slower.
-$body = '{"moe_cache_size":512,"num_pages":1440,"num_mamba_slots":5}'
+$body = '{"moe_cache_size":512,"num_pages":1360,"num_mamba_slots":4}'
 $log = Join-Path $LogDir "kv_rebuild.log"
 $deadline = (Get-Date).AddMinutes(15)
 

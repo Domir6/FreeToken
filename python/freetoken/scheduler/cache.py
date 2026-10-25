@@ -258,16 +258,26 @@ class CacheManager:
                     "SSD entries are written but not reloaded"
                 )
             return handle
-        cached_len = handle.cached_len
-        if self.is_hybrid:
-            reattached = self._try_reattach_mamba(input_ids, handle)
-            if reattached is not None:
-                return reattached
-            cached_len = handle.cached_len
-
-        entry = store.lookup(input_ids, min_len=cached_len)
-        if entry is None or entry.kv_start > cached_len or entry.length <= cached_len:
-            return handle
+        cached_len = handle.cached_len
+
+        if self.is_hybrid:
+            reattached = self._try_reattach_mamba(input_ids, handle)
+            if reattached is not None:
+                # Re-attach fixes ONLY the GDN state up to the tree match; the KV extend
+                # below must still run -- a 57k sess snapshot can restore everything past
+                # the re-attach point (18:33 case: re-attach 8128, sess idle at 57280).
+                handle = reattached
+                cached_len = handle.cached_len
+            else:
+                cached_len = handle.cached_len
+        entry = store.lookup(input_ids, min_len=cached_len)
+        if entry is None or entry.kv_start > cached_len or entry.length <= cached_len:
+            # Cold start (GPU hit is empty): a whole-session snapshot (kind="sess",
+            # kv_start=0) can bring the ENTIRE prefix back -- segment entries cannot
+            # (they need a GPU hit to extend from). Session snapshot spec v1.0.
+            entry = store.lookup_session(input_ids) if cached_len == 0 else None
+            if entry is None or entry.kv_start > cached_len or entry.length <= cached_len:
+                return handle
         # The entry can reach back before the GPU hit (e.g. two sessions sharing the same
         # template pages); only the part beyond the hit's end is copied.
         skip = cached_len - entry.kv_start
@@ -682,8 +692,21 @@ class CacheManager:
             else:
                 self.unlock(old_handle)
                 self._free(page_indices[free_upto :])
-            self._free_req_slots(req, keep_live=keep_live)
-            return
+                self._free_req_slots(req, keep_live=keep_live)
+                # User ruling: snapshot GDN+QSA at EVERY decode end -- this is the one
+                # moment they are naturally aligned (KV committed, GDN slot live). Sub-agent
+                # bursts have no idle transitions, so the idle hook alone never snapshots
+                # them; here every finished request pays a ~1-2s capture (dedup makes
+                # repeats free) and buys the next revisit a 2s restore instead of 25s prefill.
+                try:
+                    _hs = self.host_store
+                    if _hs is not None and os.environ.get(
+                        "FREETOKEN_KV_SESS_SNAPSHOT", "1"
+                    ).strip().lower() not in ("0", "false", "off", "no"):
+                        _hs.capture_sessions(self.prefix_cache)
+                except Exception:
+                    pass
+                return
 
         # Prefill chunk commit: donate the frozen snapshot at the tracked ×64 boundary.
         L = req.mamba_last_track_seqlen
